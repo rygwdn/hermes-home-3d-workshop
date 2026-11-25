@@ -1398,7 +1398,7 @@ def test_r3_a_stop_the_stop_tool_could_not_match_still_closes_the_job():
     assert "failed" not in later, later
 
 
-# ---- delivery: outbox records, groups, who is told ---------------------------------------------------------------
+# ---- delivery: outbox records and who is told ---------------------------------------------------------------
 def test_dl_without_targets_nothing_counts_as_notified(rig):
     """Audit: with empty targets events were stored owner_notified=1 / family_notified=1 though nothing was sent."""
     rig.store.upsert_job(7, name="Vazo.gcode.3mf", requester="Mum", state="queued")
@@ -1440,28 +1440,9 @@ def test_dl_an_outsider_requester_is_not_announced_the_owner_is_told():
     assert "in no group" not in p2["owner_text"]  # told once per job
 
 
-def test_dl_a_team_group_hears_neutral_wording_in_its_own_chat():
-    lab = {"name": "Lab", "target": "telegram:<lab-group>", "language": "en", "tone": "team", "members": ["u-alex"]}
-    rig = Rig(language="tr", family_target="whatsapp:<family-group>", groups=[lab])
-    rig.run()
-    rid = rig.store.add_request(requester="Alex", text="sensor bracket", platform="telegram", chat_id="<lab-group>",
-                                sender_id="u-alex")
-    rig.store.upsert_job(9, request_id=rid, name="bracket.gcode.3mf", requester="Alex", state="queued")
-    rig.status(RUNNING, job_name="bracket", progress=10, layer=1, total_layers=10, bed_temp=60, remaining_min=30)
-    (st,) = rig.run(2)
-    assert st["family_text"] == '🖨️ Print started: "sensor bracket" (for Alex), about 30 min.' and st["group"] == "Lab"
-    rig.status(PAUSE, job_name="bracket", progress=30, layer=3, total_layers=10)
-    (p,) = rig.run(2)
-    assert p["family_text"].startswith('⏸️ Print paused: "sensor bracket" (for Alex)')
-    assert "Duraklatıldı" in p["owner_text"]  # the owner keeps the technical notice in the household language
-    box = notify.read_outbox()
-    assert {r["target"] for r in box if r["audience"] == "team"} == {"telegram:<lab-group>"}
-    assert not [r for r in box if r["target"] == "whatsapp:<family-group>"]
-
-
 def test_dl_done_box_records_pushed_off_and_on_plate_parts_and_collected():
-    lab = {"name": "Lab", "target": "telegram:<lab-group>", "tone": "team", "members": ["u-alex"]}
-    rig = Rig(language="en", groups=[lab], household=[{"id": "fam-1", "name": "Mum"}])
+    rig = Rig(language="en", household=[{"id": "fam-1", "name": "Mum"},
+                                        {"id": "u-alex", "name": "Alex"}])
     rig.run()
     # an auto-eject job for Mum: pushed off into the done box
     rig.store.upsert_job(7, name="Gift box.gcode.3mf", requester="Mum", eject_planned=1, state="queued")
@@ -1475,7 +1456,7 @@ def test_dl_done_box_records_pushed_off_and_on_plate_parts_and_collected():
     assert (gift["queue_item_id"], gift["requester"], gift["left_plate"], gift["collected"]) == (7, "Mum",
                                                                                                "pushed_off", 0)
     assert gift["photo"] and Path(gift["photo"]).is_file()
-    # a manual job for Alex (the lab): waits on the plate until the camera sees it empty
+    # a manual job for Alex: waits on the plate until the camera sees it empty
     rig.status(IDLE, bed_temp=25)
     rig.run(2)
     rig.store.upsert_job(8, name="bracket.gcode.3mf", requester="Alex", eject_planned=0, state="queued",
@@ -1486,8 +1467,8 @@ def test_dl_done_box_records_pushed_off_and_on_plate_parts_and_collected():
     rig.status(FINISH, job_name="bracket", progress=100, bed_temp=40)
     out = rig.run(2)
     bracket = next(p for p in rig.store.done_box() if p["queue_item_id"] == 8)
-    assert bracket["left_plate"] == "on_plate" and bracket["group_name"] == "Lab"
-    assert any("Ready to collect" in r["family_text"] for r in out)  # the lab hears it waits on the plate
+    assert bracket["left_plate"] == "on_plate" and bracket["requester"] == "Alex"
+    assert any("waiting on the printer" in r["family_text"] for r in out)
     assert [m["kind"] for m in rig.store.open_human_needed()] == ["remove_part"]
     rig.b.plate = EMPTY
     rig.status(IDLE, bed_temp=25)

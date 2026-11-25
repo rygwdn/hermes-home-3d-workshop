@@ -513,7 +513,7 @@ def _h_status(rt, a: dict, kw: dict) -> dict:
     _, sender = _who(rt, kw)
     if _is_owner(rt, sender):  # targets, texts and names: the owner only (any group member may call status)
         out["notices"] = outbox_summary(store, failures=3)
-        out["done_box"] = [{k: p.get(k) for k in ("id", "job_name", "title", "requester", "group_name",
+        out["done_box"] = [{k: p.get(k) for k in ("id", "job_name", "title", "requester",
                                                   "left_plate")} for p in store.done_box(collected=False, limit=5)]
         out["waiting_on_people"] = [{k: m.get(k) for k in ("id", "kind", "job_name", "detail")}
                                     for m in store.open_human_needed(limit=5)]

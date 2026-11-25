@@ -1,4 +1,4 @@
-"""Delivery: the durable outbox (notify.enqueue / flush / outbox_summary), origin and groups (route_for), who is
+"""Delivery: the durable outbox (notify.enqueue / flush / outbox_summary), request origin, who is
 told, the done box and open human-needed moments. No real ``hermes send``: ``notify.send`` is replaced."""
 
 from __future__ import annotations
@@ -203,55 +203,25 @@ def test_an_old_database_is_migrated_and_keeps_working(data_dir):
     assert store.open_human_needed() == []  # an old moment is history, not an open one
 
 
-# ---- 2. origin and groups ---------------------------------------------------------------------------------------
-LAB = {"name": "Lab", "target": "telegram:<lab-group>", "language": "en", "tone": "team", "members": ["u-alex"]}
-HOME = {"name": "Home", "target": "whatsapp:<family-group>", "language": "tr", "tone": "family", "members": "fam-1"}
+def test_legacy_group_columns_do_not_affect_existing_owner_data(tmp_path):
+    path = tmp_path / "legacy-groups.sqlite"
+    store = Store(path)
+    notice_id = store.outbox_add(audience="owner", target=OWNER, text="Ready")
+    part_id = store.record_done_part(7, requester="Sam", left_plate="on_plate")
+    with sqlite3.connect(path) as db:
+        db.execute("ALTER TABLE outbox ADD COLUMN group_name TEXT NOT NULL DEFAULT ''")
+        db.execute("ALTER TABLE done_box ADD COLUMN group_name TEXT NOT NULL DEFAULT ''")
 
-
-def test_groups_are_parsed_leniently():
-    s = Settings(groups=[LAB, {"name": "lab", "target": "x"}, {"target": "no name"},
-                         {"name": "Odd", "tone": "loud", "language": "de", "members": "a, b"}, "junk"])
-    lab, odd = s.group_list()
-    assert lab.name == "Lab" and lab.tone == "team" and lab.members == ["u-alex"]  # first of a name wins
-    assert odd.tone == "family" and odd.language == "" and odd.members == ["a", "b"]
-    assert s.group_language(odd) == s.language and s.group_named("LAB") == lab
-
-
-def test_target_is_chat_compares_platform_and_chat_exactly():
-    from home3d_ws.home3d.config import target_is_chat
-
-    assert target_is_chat("telegram:<lab-group>", "telegram", "<lab-group>")
-    assert not target_is_chat("telegram:<lab-group>", "whatsapp", "<lab-group>")
-    assert not target_is_chat("telegram:<lab-group>", "telegram", "<lab-group>-2")
-    assert not target_is_chat("", "telegram", "") and not target_is_chat("telegram:x", "telegram", "")
-
-
-def test_route_origin_chat_wins_then_member_then_household_then_nobody():
-    s = _s(groups=[LAB, HOME], household=[{"id": "fam-1", "name": "Mum"}, {"id": "fam-2", "name": "Dad"}])
-    # asked in the lab chat: the lab hears, even a household member
-    r = N.route_for(s, requester="Mum", platform="telegram", chat_id="<lab-group>", sender_id="fam-1")
-    assert (r.announce, r.group, r.audience, r.language, r.target) == (True, "Lab", "team", "en",
-                                                                      "telegram:<lab-group>")
-    # asked in a DM: the group that lists the sender
-    r = N.route_for(s, requester="Alex", platform="telegram", chat_id="<dm>", sender_id="u-alex")
-    assert r.group == "Lab"
-    r = N.route_for(s, requester="Mum", platform="whatsapp", chat_id="<dm>", sender_id="fam-1")
-    assert (r.group, r.audience, r.language) == ("Home", "family", "tr")
-    # a household member in no group: family_target, as before groups existed
-    r = N.route_for(s, requester="Dad", sender_id="fam-2")
-    assert (r.announce, r.group, r.target) == (True, "", FAMILY)
-    # nobody in a group or the household: not announced (the owner is told)
-    r = N.route_for(s, requester="Alex", platform="telegram", chat_id="<dm>", sender_id="u-other")
-    assert (r.announce, r.why) == (False, "outsider")
-    assert N.route_for(s, requester="Sam").why == "owner"
-    assert N.route_for(s).why == "nobody"
-    # the owner queued it for Mum from the owner's DM: Mum's group
-    assert N.route_for(s, requester="Mum", chat_id="<owner-dm>", sender_id="owner-1").group == "Home"
-
-
-def test_without_groups_routing_is_unchanged_for_household_members():
-    r = N.route_for(_s(), requester="Mum")
-    assert (r.announce, r.audience, r.target, r.group) == (True, "family", FAMILY, "")
+    reopened = Store(path)
+    notice, = reopened.outbox_pending()
+    assert (notice["id"], notice["target"], notice["text"]) == (notice_id, OWNER, "Ready")
+    assert "group_name" not in notice
+    assert reopened.outbox_add(audience="owner", target=OWNER, text="Next") > notice_id
+    assert reopened.record_done_part(7, left_plate="taken_off") == part_id
+    part, = reopened.done_box()
+    assert (part["requester"], part["left_plate"]) == ("Sam", "taken_off")
+    assert "group_name" not in part and reopened.get_done_part(part_id) == part
+    assert reopened.record_done_part(8, requester="Sam") > part_id
 
 
 def test_session_chat_id_reads_the_documented_session_env(monkeypatch):
@@ -305,30 +275,16 @@ def test_a_person_confirming_the_plate_marks_waiting_parts_taken_off():
     assert part["requester"] == "Alex" and part["left_plate"] == "taken_off"
 
 
-def test_team_wording_has_no_family_forms_of_address():
-    from home3d_ws.home3d import messages as M
-
-    ctx = dict(requester="Mum", address_as="Mum dear", family_job='"sensor bracket"', job="bracket", progress=40,
-               owner="Sam")
-    for lang in ("en", "tr"):
-        for kind in ("started", "finished", "finished_ejected", "plate_not_clear", "failed", "paused"):
-            text = M.render(kind, "team", lang, **ctx)
-            assert text and "Mum dear" not in text and "Mum" in text, (kind, lang, text)
-        assert "Mum dear" in M.render("finished", "family", lang, **ctx)  # family keeps today's wording
-    assert M.render("hms", "team", "en", **ctx) == ""  # owner-only kinds stay owner-only
-
-
 # ---- review fixes -----------------------------------------------------------------------------------------------
 def test_a_known_sender_decides_who_asked_not_a_matching_household_name():
-    """Review: the model writes the requester name; a lab sender named like a household person is not family."""
-    lab = {"name": "Lab", "target": "telegram:<lab>", "tone": "team", "members": ["lab-1"]}
-    s = _s(household=[{"id": "fam-1", "name": "Alex"}], groups=[lab])
-    r = N.route_for(s, requester="Alex", platform="telegram", chat_id="", sender_id="lab-9")
-    assert r.announce is False and r.why == "outsider" and r.target == ""
-    # the household person themselves, the owner asking for them, or no sender id at all: family as before
-    assert N.route_for(s, requester="Alex", sender_id="fam-1").target == FAMILY
-    assert N.route_for(s, requester="Alex", sender_id="owner-1").target == FAMILY
-    assert N.route_for(s, requester="Alex").target == FAMILY
+    """Review: the model writes the requester name; an unknown sender named like a household person is not family."""
+    s = _s(household=[{"id": "fam-1", "name": "Alex"}])
+    assert N.route_for(s, requester="Alex", chat_id="<other-chat>", sender_id="outsider").why == "outsider"
+    assert N.route_for(s, requester="Alex", chat_id="<other-chat>", sender_id="fam-1").announce
+    assert N.route_for(s, requester="Alex", sender_id="owner-1").announce
+    assert N.route_for(s, requester="Alex").announce
+    assert N.route_for(s, requester="Sam", sender_id="owner-1").why == "owner"
+    assert N.route_for(s).why == "nobody"
 
 
 def _passes(s, store, fake, start, end, step=60.0):

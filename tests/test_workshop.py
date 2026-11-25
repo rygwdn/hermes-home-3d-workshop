@@ -33,7 +33,7 @@ FIXTURE = Path(__file__).resolve().parent / "fixtures" / "workshop_overview.json
 FIXTURE_FILES = FIXTURE.parent / "workshop_files"
 TOP_KEYS = {"schema", "generated_ts", "backend", "persona", "simulated", "printer", "now", "camera", "waiting",
             "queue", "done_box", "notices", "filament", "needs_human", "upgrades", "designs", "setup", "watcher",
-            "groups", "viewer"}
+            "viewer"}
 BRACKET_SCAD = """// wall bracket for a 20 mm rail
 width = 40; depth = 30; thick = 4; height = 35;
 difference() {
@@ -58,8 +58,6 @@ class Shop:
         self.settings = Settings(
             backend="simulator", language="en", persona_name="Mıstık", owner_name="Sam", owner_ids=[OWNER],
             household=[{"id": MUM, "name": "Mum"}, {"id": ENGINEER, "name": "Engineer"}],
-            groups=[{"name": "Family", "target": "telegram:<family-group>", "tone": "family", "members": [MUM]},
-                    {"name": "R&D", "target": "telegram:<lab-group>", "tone": "team", "members": [ENGINEER]}],
             owner_target="telegram:<owner-chat>", family_target="telegram:<family-group>")
         self.be = SimulatorBackend()
         self.store = Store()
@@ -168,6 +166,7 @@ def shop():
 def test_fresh_simulator_overview_has_every_section_and_nothing_made_up(shop):
     ov = shop.overview()
     assert TOP_KEYS <= set(ov) and ov["schema"] == workshop.SCHEMA_VERSION
+    assert "groups" not in ov
     assert ov["backend"] == "simulator" and ov["simulated"] is True and ov["persona"] == "Mıstık"
     assert ov["printer"]["state"] == "idle" and ov["printer"]["errors"] == []
     assert ov["now"] is None and ov["waiting"] == [] and ov["queue"] == [] and ov["done_box"] == []
@@ -177,9 +176,6 @@ def test_fresh_simulator_overview_has_every_section_and_nothing_made_up(shop):
     assert ov["filament"]["slots"][0]["label"] == "Slot 1"
     assert ov["watcher"]["fresh"] is True and ov["watcher"]["model_calls"] == 0
     assert ov["camera"]["available"] is True and ov["camera"]["frame"] is None
-    assert ov["groups"] == [{"name": "Family", "tone": "family", "language": "en", "members": 1},
-                            {"name": "R&D", "tone": "team", "language": "en", "members": 1}]
-    assert "target" not in json.dumps(ov["groups"])
     assert ov["viewer"] == {"is_owner": True, "reason": ""}
     setup = ov["setup"]
     assert setup["checked_ts"] and setup["pending"] is False  # the first overview waited for the run
@@ -202,7 +198,7 @@ def test_a_designed_part_waiting_for_the_owners_approval(shop):
     req = shop.store.approval_requests()[0]
     assert w["id"] == req["id"] and w["source"] == "request" and w["action"] == "start"
     assert w["queue_item_id"] == qid and w["command"] == f"home3d approve start {qid}" and w["alt"] is None
-    assert w["asked_by"] == {"name": "Engineer", "group": "R&D"} and w["request_text"] == "a bracket for the lab rail"
+    assert w["asked_by"] == {"name": "Engineer"} and w["request_text"] == "a bracket for the lab rail"
     f = w["facts"]
     assert f["print_time_min"] and f["grams"] and f["material"] == "PLA" and f["color"] == "#000000"
     assert f["slot"] == 2 and f["slot_label"] == "Slot 3" and isinstance(f["eject_planned"], bool)
@@ -243,7 +239,7 @@ def test_the_owners_own_queued_job_also_waits_and_a_job_ahead_blocks_the_turn(sh
     assert turn["ok"] is False and "waiting ahead" in turn["detail"]
     assert w["ready"] is False and w["alt"]["command"] == f"home3d approve start {qid} jump"
     foreign = next(i for i in ov["queue"] if not i["ours"])
-    assert foreign["for"] == {"name": "", "group": ""} and foreign["eject_planned"] is None
+    assert foreign["for"] == {"name": ""} and foreign["eject_planned"] is None
 
 
 def test_printing_for_mum_shows_who_progress_and_the_queue(shop):
@@ -256,7 +252,7 @@ def test_printing_for_mum_shows_who_progress_and_the_queue(shop):
     p = ov["printer"]
     assert p["state"] == "printing" and p["job_name"] == "Flower gift box"
     assert 0 < p["progress"] < 100 and p["remaining_min"] > 0 and p["layer"] and p["total_layers"]
-    assert ov["now"]["queue_item_id"] == qid and ov["now"]["for"] == {"name": "Mum", "group": "Family"}
+    assert ov["now"]["queue_item_id"] == qid and ov["now"]["for"] == {"name": "Mum"}
     assert reply.endswith("[home3d:ok]") and "\"Flower gift box\"" in reply, reply
     assert ov["now"]["eject_planned"] is True and ov["now"]["model"] is None  # a MakerWorld model: no local STL
     assert [(i["id"], i["status"]) for i in ov["queue"]] == [(qid, "printing")]
@@ -272,12 +268,12 @@ def test_after_a_finish_the_part_is_in_the_done_box_with_its_photo(shop):
     box = ov["done_box"]
     part = shop.store.done_box()[0]
     assert len(box) == 1 and box[0]["job_id"] == qid and box[0]["id"] == part["id"] and box[0]["outcome"] == "pushed"
-    assert box[0]["for"] == {"name": "Mum", "group": "Family"} and box[0]["collected"] is False
+    assert box[0]["for"] == {"name": "Mum"} and box[0]["collected"] is False
     assert ov["generated_ts"] - 3600 < box[0]["finished_ts"] <= ov["generated_ts"] + 1  # wall time, not sim time
     assert box[0]["command"] == f"home3d collected {part['id']}"
     assert box[0]["photo"] and workshop.resolve_file(shop.rt, box[0]["photo"]).is_file()
     assert ov["camera"]["frame"] and ov["camera"]["taken_ts"]
-    assert any(n["to"] == "Family" for n in ov["notices"]["recent"])
+    assert any(n["to"] == "family chat" for n in ov["notices"]["recent"])
     assert ov["now"]["queue_item_id"] == qid  # the finished job is still what the printer shows
 
 
@@ -355,7 +351,7 @@ def test_the_overview_never_takes_a_photo_checks_the_plate_or_writes_to_the_prin
     assert ov["waiting"] and ov["problems"] == []
 
 
-def test_collected_through_the_command_and_the_groups_setting(shop):
+def test_collected_through_the_command(shop):
     qid = shop.request("s-mum", MUM, COASTER, "a coaster")
     shop.slash(f"approve start {qid}")
     shop.run_until({"finished_ejected"})
@@ -365,19 +361,17 @@ def test_collected_through_the_command_and_the_groups_setting(shop):
     assert reply.endswith("[home3d:ok]") and "coaster" in reply.lower(), reply
     d = shop.overview()["done_box"][0]
     assert d["collected"] is True and d["collected_by"] == "Sam" and d["collected_ts"]
-    shop.settings.groups = [{"name": "Lab", "tone": "team", "target": "telegram:<lab>"}]
-    assert shop.overview()["groups"] == [{"name": "Lab", "tone": "team", "language": "en", "members": 0}]
 
 
 def test_notices_show_dry_run_neutrally_and_hide_texts_from_a_non_owner(shop):
     shop.store.outbox_add(audience="family", target="telegram:<family-group>", text="Your coaster is ready",
-                          group="Family", status="dry_run", job_name="coaster.gcode.3mf")
+                          status="dry_run", job_name="coaster.gcode.3mf")
     shop.store.outbox_add(audience="owner", target="telegram:<owner-chat>", text="Coaster done", status="pending")
     ov = shop.overview()
     n = ov["notices"]
     assert n["dry_run"] == 1 and n["failed"] == 0 and n["pending"] == 1
     dry = next(r for r in n["recent"] if r["status"] == "dry_run")
-    assert dry["to"] == "Family" and dry["text"] == "Your coaster is ready" and dry["job"] == "coaster"
+    assert dry["to"] == "family chat" and dry["text"] == "Your coaster is ready" and dry["job"] == "coaster"
     assert "<family-group>" not in json.dumps(n) and "<owner-chat>" not in json.dumps(n)
     shop.settings.local_is_owner = False
     n = shop.overview()["notices"]
@@ -528,7 +522,7 @@ def test_showcase_fills_every_section(shop):
     assert {d["outcome"] for d in ov["done_box"]} == {"pushed", "taken_off"}
     assert any(d["collected"] for d in ov["done_box"])
     assert ov["needs_human"] and ov["upgrades"] and ov["designs"] and ov["notices"]["recent"]
-    assert ov["camera"]["frame"] and ov["filament"]["slots"] and ov["groups"]
+    assert ov["camera"]["frame"] and ov["filament"]["slots"]
     assert ov["problems"] == []
 
 

@@ -12,11 +12,11 @@ Tables:
                 watcher tells the owner once (it authorises nothing: the owner still sends /home3d approve ...)
   outbox        every notice as a durable record with its real delivery state (pending | sent | failed | no_target |
                 dry_run), attempt count and last error; a failed send is retried on later watcher passes (notify.py)
-  done_box      delivered parts: who each one is for, which group, the photo, how it left the plate, collected or not
+  done_box      delivered parts: who each one is for, the photo, how it left the plate, collected or not
   kv            small key/value state (watcher last state, session -> sender map, plate confirmations, ...)
 
 Where a request came from (``requests.platform`` / ``chat_id`` / ``sender_id``, the same three on ``jobs`` for a job
-queued without a request) decides which group hears about its job. Human-needed moments are open until the event
+queued without a request) is kept with it. Human-needed moments are open until the event
 that resolves them (``resolve_human_needed``). Columns added after the first release are added to existing databases
 by ``_migrate`` (``ALTER TABLE ... ADD COLUMN``), so an old database keeps working.
 
@@ -141,8 +141,7 @@ CREATE TABLE IF NOT EXISTS outbox (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   ts REAL NOT NULL,                        -- queued (wall clock, for display)
   clock_ts REAL NOT NULL,                  -- queued on the watcher's clock (retry schedule, age cap)
-  audience TEXT NOT NULL DEFAULT '',       -- owner | family | team (the tone of who is told)
-  group_name TEXT NOT NULL DEFAULT '',     -- the configured group ('' = owner chat / family_target)
+  audience TEXT NOT NULL DEFAULT '',       -- owner | family (who is told)
   target TEXT NOT NULL DEFAULT '',         -- hermes send target ('' = nowhere to send)
   kinds TEXT NOT NULL DEFAULT '',          -- event kinds in this message, comma separated
   job_name TEXT NOT NULL DEFAULT '',
@@ -167,7 +166,6 @@ CREATE TABLE IF NOT EXISTS done_box (
   job_name TEXT NOT NULL DEFAULT '',
   title TEXT NOT NULL DEFAULT '',          -- what was asked for (or the file name without its suffix)
   requester TEXT NOT NULL DEFAULT '',      -- who it is for ('' = nobody named)
-  group_name TEXT NOT NULL DEFAULT '',     -- the group that was told ('' = none / the family chat)
   photo TEXT NOT NULL DEFAULT '',          -- path of the photo of the finished part
   left_plate TEXT NOT NULL DEFAULT 'unknown',  -- pushed_off | on_plate | taken_off | unknown (DONE_BOX_STATES)
   collected INTEGER NOT NULL DEFAULT 0,
@@ -779,7 +777,7 @@ class Store:
 
     # ---- outbox: every notice with its real delivery state (notify.py sends and settles) --------------------
     def outbox_add(self, *, audience: str, target: str, text: str, media: str = "", kinds: Any = (),
-                   job_name: str = "", requester: str = "", group: str = "", refs: Optional[dict] = None,
+                   job_name: str = "", requester: str = "", refs: Optional[dict] = None,
                    status: str = "pending", clock: Optional[float] = None) -> int:
         """Queue one notice. ``status``: "pending" (to be sent), "no_target" (nowhere to send: never "notified") or
         "dry_run" (a dry run: nothing is sent). ``clock`` is the watcher's clock (the retry schedule runs on it).
@@ -793,9 +791,9 @@ class Store:
             c.execute("DELETE FROM outbox WHERE status!='pending' AND ts<? AND NOT (status='failed' AND surfaced=0)",
                       (now - OUTBOX_KEEP_S,))
             cur = c.execute(
-                "INSERT INTO outbox(ts,clock_ts,audience,group_name,target,kinds,job_name,requester,text,media,status,"
-                "refs) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
-                (now, clock_ts, str(audience or ""), str(group or ""), str(target or "").strip(), names,
+                "INSERT INTO outbox(ts,clock_ts,audience,target,kinds,job_name,requester,text,media,status,"
+                "refs) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                (now, clock_ts, str(audience or ""), str(target or "").strip(), names,
                  str(job_name or ""), str(requester or ""), str(text or ""), str(media or ""), status,
                  json.dumps(refs or {}, ensure_ascii=False)))
             return int(cur.lastrowid)
@@ -803,6 +801,7 @@ class Store:
     @staticmethod
     def _outbox_row(row: Any) -> dict:
         rec = dict(row)
+        rec.pop("group_name", None)  # old databases retain the unused column
         try:
             refs = json.loads(rec.get("refs") or "{}")
         except ValueError:
@@ -818,7 +817,7 @@ class Store:
 
     def outbox(self, status: Optional[str] = None, limit: int = 50) -> list[dict]:
         """Outbox records, newest first (``status``: one of ``OUTBOX_STATUSES``, None = all). Each row: id, ts,
-        audience, group_name, target, kinds (list), job_name, requester, text, media, status, attempts, last_error,
+        audience, target, kinds (list), job_name, requester, text, media, status, attempts, last_error,
         last_attempt_ts, next_try_clock, sent_ts, surfaced, refs (dict)."""
         with self._conn() as c:
             if status:
@@ -888,13 +887,13 @@ class Store:
 
     # ---- done box: delivered parts a person collects ------------------------------------------------------------
     def record_done_part(self, queue_item_id: Optional[int], *, job_name: str = "", title: str = "",
-                         requester: str = "", group: str = "", photo: str = "", left_plate: str = "unknown",
+                         requester: str = "", photo: str = "", left_plate: str = "unknown",
                          request_id: Optional[int] = None, ts: Optional[float] = None) -> int:
-        """Record (or update) the finished part of a workshop job: who it is for, which group was told, the photo and
-        how it left the plate (``DONE_BOX_STATES``: pushed_off = the end G-code pushed it into the done box, on_plate
-        = it waits on the plate for a person, taken_off = a person took it off the plate, unknown). One record per
-        queue item: a later call updates it (an empty ``photo`` / ``group`` / ``requester`` never erases a known
-        one) and never touches ``collected``. Returns the record id."""
+        """Record (or update) the finished part of a workshop job: who it is for, the photo and how it left the
+        plate (``DONE_BOX_STATES``: pushed_off = the end G-code pushed it into the done box, on_plate = it waits on
+        the plate for a person, taken_off = a person took it off the plate, unknown). One record per queue item: a
+        later call updates it (an empty ``photo`` / ``requester`` never erases a known one) and never touches
+        ``collected``. Returns the record id."""
         state = left_plate if left_plate in DONE_BOX_STATES else "unknown"
         now = time.time()
         with self._write_txn() as c:
@@ -904,15 +903,15 @@ class Store:
                                 (int(queue_item_id),)).fetchone()
             if row is None:
                 cur = c.execute(
-                    "INSERT INTO done_box(ts,queue_item_id,request_id,job_name,title,requester,group_name,photo,"
-                    "left_plate,updated) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                    "INSERT INTO done_box(ts,queue_item_id,request_id,job_name,title,requester,photo,"
+                    "left_plate,updated) VALUES(?,?,?,?,?,?,?,?,?)",
                     (float(ts) if ts is not None else now, queue_item_id, request_id, str(job_name or ""),
-                     str(title or ""), str(requester or ""), str(group or ""), str(photo or ""), state, now))
+                     str(title or ""), str(requester or ""), str(photo or ""), state, now))
                 return int(cur.lastrowid)
-            c.execute("UPDATE done_box SET job_name=?, title=?, requester=?, group_name=?, photo=?, left_plate=?, "
+            c.execute("UPDATE done_box SET job_name=?, title=?, requester=?, photo=?, left_plate=?, "
                       "request_id=?, updated=? WHERE id=?",
                       (str(job_name or "") or row["job_name"], str(title or "") or row["title"],
-                       str(requester or "") or row["requester"], str(group or "") or row["group_name"],
+                       str(requester or "") or row["requester"],
                        str(photo or "") or row["photo"], row["left_plate"] if state == "unknown" else state,
                        request_id if request_id is not None else row["request_id"], now, row["id"]))
             return int(row["id"])
@@ -927,9 +926,9 @@ class Store:
         return cur.rowcount == 1
 
     def done_box(self, collected: Optional[bool] = None, requester: Optional[str] = None,
-                 group: Optional[str] = None, limit: int = 50) -> list[dict]:
+                 limit: int = 50) -> list[dict]:
         """Delivered parts, newest first. ``collected=False``: what still waits to be picked up. Each row: id, ts,
-        queue_item_id, request_id, job_name, title, requester, group_name, photo, left_plate, collected (0/1),
+        queue_item_id, request_id, job_name, title, requester, photo, left_plate, collected (0/1),
         collected_ts, collected_by, updated."""
         sql, params = "SELECT * FROM done_box WHERE 1=1", []
         if collected is not None:
@@ -938,16 +937,18 @@ class Store:
         if requester:
             sql += " AND lower(requester)=lower(?)"
             params.append(str(requester))
-        if group:
-            sql += " AND lower(group_name)=lower(?)"
-            params.append(str(group))
         sql += " ORDER BY ts DESC, id DESC LIMIT ?"
         params.append(int(limit))
-        return self._rows(sql, tuple(params))
+        return [self._done_part_row(r) for r in self._rows(sql, tuple(params))]
+
+    @staticmethod
+    def _done_part_row(row: dict) -> dict:
+        row.pop("group_name", None)  # old databases retain the unused column
+        return row
 
     def get_done_part(self, part_id: int) -> Optional[dict]:
         rows = self._rows("SELECT * FROM done_box WHERE id=?", (int(part_id),))
-        return rows[0] if rows else None
+        return self._done_part_row(rows[0]) if rows else None
 
     def set_collected(self, part_id: int, collected: bool = True, by: str = "") -> bool:
         """Mark a done-box part collected (or put it back with ``collected=False``). ``by`` is who took it. False

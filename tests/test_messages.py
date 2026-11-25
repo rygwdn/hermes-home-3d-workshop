@@ -298,4 +298,4 @@ def test_started_by_tells_the_owner_who_started_what_and_how_to_stop_it():
         '▶️ Mum kendi işini başlattı: "Mum key tag v1" (13 dk). Durdurmak için: /home3d stop'
     assert M.render("started_by", "owner", "en", who="Mum", queue_item_id=7) == \
         "▶️ Mum started #7. Stop it with /home3d stop."
-    assert M.render("started_by", "family", "en", **ctx) == "" and M.render("started_by", "team", "tr", **ctx) == ""
+    assert M.render("started_by", "family", "en", **ctx) == ""

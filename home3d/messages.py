@@ -1,12 +1,11 @@
-"""Owner vs family vs team message templates (tr / en). Pure, stdlib only.
+"""Owner and household requester messages (tr / en). Pure, stdlib only.
 
 ``render(kind, audience, lang, **ctx)`` returns the text, or ``""`` when that audience should not get a
 message for this kind (offline, HMS, ready-next and upgrade notices are owner-only).
 
 Family: one or two short warm lines, plain words, addressed to the requester (``address_as`` or
 ``requester``) when known, never English words inside Turkish. Owner: technical (state, layer, temps,
-HMS, links) but still short. Team (a group whose ``tone`` is "team", e.g. a lab): the same facts as the
-family line in plain, neutral wording: no forms of address, the requester is named as "for <name>".
+HMS, links) but still short.
 
 The person who asked hears: ``started`` (one line), ``finished`` / ``finished_ejected`` (with the photo),
 ``failed``, ``paused``, and what needs them (``plate_not_clear``: ready to collect from the plate,
@@ -56,8 +55,6 @@ _STATE_WORDS = {"PREPARE": ("preparing", "hazırlanıyor"), "RUNNING": ("printin
                 "FAILED": ("failed", "yarıda kaldı"), "IDLE": ("idle", "boşta"), "UNKNOWN": ("unknown", "bilinmiyor")}
 ERROR_MAX = 300  # owner texts quote at most this much of a printer manager's error message
 FAMILY_JOB_MAX = 40  # family texts quote at most this many characters of the request text
-AUDIENCES = ("owner", "family", "team")
-REQUESTER_AUDIENCES = ("family", "team")  # the tones a group can have (config.GROUP_TONES)
 FAILURES_MAX = 3  # a delivery_failed notice lists at most this many undelivered notices
 
 _TR_BACK = set("aıou")
@@ -340,84 +337,6 @@ def _f_eject_skipped(c: dict, tr: bool) -> str:
     if tr:
         return f"ℹ️ {job} kendi düşmeyecek, bitince yazıcıdan alınması gerekecek."
     return f"ℹ️ {job} won't drop off by itself, someone will need to take it off when it's done."
-
-
-# ---- team templates (a group with tone "team": plain and neutral, no forms of address) ---------------------
-def _t_ref(c: dict, tr: bool) -> str:
-    """'"bracket v2" (for Sam)': the print as the team knows it, and whose it is (by name, never ``address_as``)."""
-    job, who = _fjob(c, tr), _s(c.get("requester"))
-    if not who:
-        return job
-    return f"{job} (isteyen: {who})" if tr else f"{job} (for {who})"
-
-
-def _t_owner_told(c: dict, tr: bool) -> str:
-    owner = _s(c.get("owner"))
-    named = bool(owner) and owner.lower() != "owner"
-    if tr:
-        return f"{dative(owner)} bildirildi." if named else "Yazıcı sorumlusuna bildirildi."
-    return f"{owner} has been notified." if named else "The printer owner has been notified."
-
-
-def _t_started(c: dict, tr: bool) -> str:
-    dur = duration(c.get("duration_min"), "tr" if tr else "en", short=True)
-    if tr:
-        return f"🖨️ Baskı başladı: {_t_ref(c, tr)}" + (f", yaklaşık {dur}." if dur else ".")
-    return f"🖨️ Print started: {_t_ref(c, tr)}" + (f", about {dur}." if dur else ".")
-
-
-def _t_finished(c: dict, tr: bool) -> str:
-    ref = _t_ref(c, tr)
-    if c.get("missed_end"):  # the watcher did not see the end: say nothing about where the part is
-        return f"✅ Baskı tamamlandı: {ref}." if tr else f"✅ Print finished: {ref}."
-    if tr:
-        return f"✅ Baskı tamamlandı: {ref}. Teslime hazır, parça yazıcının tablasında."
-    return f"✅ Print finished: {ref}. Ready to collect: the part is on the build plate."
-
-
-def _t_finished_ejected(c: dict, tr: bool) -> str:
-    ref = _t_ref(c, tr)
-    if tr:
-        return f"✅ Baskı tamamlandı: {ref}. Tabladan itildi, teslime hazır: biten parçalar kutusundan alınabilir."
-    return f"✅ Print finished: {ref}. It was pushed off the plate. Ready to collect from the done box."
-
-
-def _t_plate_not_clear(c: dict, tr: bool) -> str:
-    ref = _t_ref(c, tr)
-    if tr:
-        return f"📦 Teslime hazır: {ref} tamamlandı ancak tabladan itilemedi. Parça yazıcının tablasından alınmalı."
-    return (f"📦 Ready to collect: {ref} is finished but could not be pushed off. Please take the part off the "
-            "build plate.")
-
-
-def _t_eject_unverified(c: dict, tr: bool) -> str:
-    ref = _t_ref(c, tr)
-    if tr:
-        return f"❓ {ref} tamamlandı, ancak kamera tablanın boş olduğunu doğrulayamadı. Yazıcının kontrol edilmesi gerekiyor."
-    return f"❓ {ref} is finished, but the camera could not confirm that the plate is empty. The printer needs a look."
-
-
-def _t_failed(c: dict, tr: bool) -> str:
-    ref, p = _t_ref(c, tr), pct(c.get("progress"), "tr" if tr else "en")
-    if tr:
-        return f"⚠️ Baskı başarısız: {ref}" + (f", {p} seviyesinde durdu" if p else " tamamlanamadı") + f". {_t_owner_told(c, tr)}"
-    return f"⚠️ Print failed: {ref}" + (f" stopped at {p}" if p else " did not finish") + f". {_t_owner_told(c, tr)}"
-
-
-def _t_paused(c: dict, tr: bool) -> str:
-    ref, p = _t_ref(c, tr), pct(c.get("progress"), "tr" if tr else "en")
-    if tr:
-        why = ", filament bitti" if c.get("filament") else ""
-        return f"⏸️ Baskı duraklatıldı: {ref}" + (f" ({p})" if p else "") + f"{why}. {_t_owner_told(c, tr)}"
-    why = ", the filament ran out" if c.get("filament") else ""
-    return f"⏸️ Print paused: {ref}" + (f" ({p})" if p else "") + f"{why}. {_t_owner_told(c, tr)}"
-
-
-def _t_eject_skipped(c: dict, tr: bool) -> str:
-    ref = _t_ref(c, tr)
-    if tr:
-        return f"ℹ️ {ref} tabladan otomatik itilmeyecek; tamamlandığında yazıcıdan elle alınması gerekecek."
-    return f"ℹ️ {ref} will not be pushed off automatically; it has to be taken off the printer by hand when it finishes."
 
 
 # ---- owner templates --------------------------------------------------------------------------
@@ -809,11 +728,6 @@ _FAMILY: dict[str, Callable[[dict, bool], str]] = {
     "plate_not_clear": _f_plate_not_clear, "eject_unverified": _f_eject_unverified, "failed": _f_failed,
     "paused": _f_paused, "eject_skipped": _f_eject_skipped,
 }
-_TEAM: dict[str, Callable[[dict, bool], str]] = {
-    "started": _t_started, "finished": _t_finished, "finished_ejected": _t_finished_ejected,
-    "plate_not_clear": _t_plate_not_clear, "eject_unverified": _t_eject_unverified, "failed": _t_failed,
-    "paused": _t_paused, "eject_skipped": _t_eject_skipped,
-}
 _OWNER: dict[str, Callable[[dict, bool], str]] = {
     "started": _o_started, "finished": _o_finished, "finished_ejected": _o_finished_ejected,
     "plate_not_clear": _o_plate_not_clear, "eject_unverified": _o_eject_unverified, "plate_clear": _o_plate_clear,
@@ -826,13 +740,15 @@ _OWNER: dict[str, Callable[[dict, bool], str]] = {
 
 
 def render(kind: str, audience: str, lang: str, **ctx: Any) -> str:
-    """Message text for ``kind`` and ``audience`` ("owner" | "family" | "team"); "" = nothing to send."""
+    """Message text for ``kind`` and ``audience`` ("owner" | "family"); "" = nothing to send."""
     tr = lang == "tr"
-    if audience in REQUESTER_AUDIENCES:
-        fn = (_TEAM if audience == "team" else _FAMILY).get(kind)
+    if audience == "family":
+        fn = _FAMILY.get(kind)
         if fn is None:
             return ""
         return "\n".join(_cap(line) for line in fn(ctx, tr).strip().splitlines())
+    if audience != "owner":
+        return ""
     fn = _OWNER.get(kind)
     if fn is None:
         job = _job_ref(ctx)

@@ -20,10 +20,10 @@ What a send that succeeded settles (``_settle``): the events of the message coun
 ``family_notified``), and the approval requests in it as announced. A record that was given up closes its approval
 requests ("the owner could not be told"), so the person can ask again.
 
-``route_for`` decides who hears about a job: the group whose target is the chat the request came from, else the
-group that lists its sender, else the household's ``family_target``; a requester in no group and not in the
-household is not announced anywhere (the owner is told instead). A known sender id decides who asked; the
-requester name (written by the model) only counts when there is no sender id or the owner asked for someone.
+``route_for`` decides who hears about a job: a household member (or the person the owner named) is announced
+in the household's ``family_target``; a requester who is not in the household is not announced anywhere (the
+owner is told instead). A known sender id decides who asked; the requester name (written by the model) only
+counts when there is no sender id or the owner asked for someone.
 
 ``outbox_summary`` is what the status tool and a UI read: counts per status and the last failures.
 
@@ -78,12 +78,8 @@ class Delivery:
 @dataclass
 class Route:
     """Who hears about a job besides the owner. ``announce`` False: nobody (``why``: "owner" = the owner's own job,
-    "nobody" = nobody is known to have asked, "outsider" = the requester is in no group and not in the household)."""
+    "nobody" = nobody is known to have asked, "outsider" = the requester is not in the household)."""
     announce: bool
-    audience: str = "family"  # the tone: family | team
-    language: str = "en"
-    target: str = ""  # '' with announce True: there is a group but no chat to send to (the record is no_target)
-    group: str = ""  # the configured group's name ('' = the household's family_target)
     why: str = ""
 
 
@@ -108,16 +104,14 @@ def _person_named(settings: Settings, name: str) -> Optional[Person]:
     return None
 
 
-def route_for(settings: Settings, *, requester: str = "", platform: str = "", chat_id: str = "",
+def route_for(settings: Settings, *, requester: str = "", chat_id: str = "",
               sender_id: str = "") -> Route:
     """Where the notices about a job go, from who asked (``requester`` name) and where the request came from
-    (``platform`` / ``chat_id`` / ``sender_id`` as stored with the request).
+    (``chat_id`` / ``sender_id`` as stored with the request).
 
-    1. the owner's own job: no group notice (the owner gets the technical one);
-    2. the group whose target IS the origin chat, else the group that lists the sender (or the requester's
-       household id): that group's target, language and tone;
-    3. a household member outside every group: ``family_target`` in the household language (as before groups);
-    4. anyone else: not announced (``why="outsider"``), or ``why="nobody"`` when nobody is known to have asked.
+    1. the owner's own job: no family notice (the owner gets the technical one);
+    2. a household member (or the person the owner named): ``family_target`` in the household language;
+    3. anyone else: not announced (``why="outsider"``), or ``why="nobody"`` when nobody is known to have asked.
     """
     name = (requester or "").strip()
     sid = norm_id(sender_id)
@@ -130,14 +124,8 @@ def route_for(settings: Settings, *, requester: str = "", platform: str = "", ch
         person = _person_named(settings, name)  # no sender id, a local session, or the owner asking for someone
     if (person and person.role == "owner") or (name and name.lower() == owner) or (not name and sender_is_owner):
         return Route(False, why="owner")
-    group = settings.group_for(platform, chat_id, "" if sender_is_owner else sender_id)
-    if group is None and person is not None and person.id:
-        group = settings.group_for(sender_id=person.id)
-    if group is not None:
-        return Route(True, audience=group.tone, language=settings.group_language(group), target=group.target,
-                     group=group.name)
     if person is not None:
-        return Route(True, audience="family", language=settings.language, target=settings.family_target)
+        return Route(True)
     if not name and not str(sender_id or "").strip() and not str(chat_id or "").strip():
         return Route(False, why="nobody")
     return Route(False, why="outsider")
@@ -300,7 +288,7 @@ def backoff_s(attempts: int) -> float:
 
 
 def enqueue(settings: Settings, store: Any, *, audience: str, target: str, text: str,
-            media: Optional[Path] = None, kinds: Any = (), job_name: str = "", requester: str = "", group: str = "",
+            media: Optional[Path] = None, kinds: Any = (), job_name: str = "", requester: str = "",
             event_ids: Any = (), approval_request_ids: Any = (), now: Optional[float] = None,
             dry_run: bool = False) -> Optional[Delivery]:
     """Write one notice to the outbox. With a target (and no dry run) it is ``pending`` until ``flush`` sent it
@@ -314,7 +302,7 @@ def enqueue(settings: Settings, store: Any, *, audience: str, target: str, text:
             "approval_request_ids": [int(i) for i in approval_request_ids or [] if i is not None]}
     final = DRY_RUN if (dry_run or _env_dry_run()) and target else "" if target else NO_TARGET
     rid = store.outbox_add(audience=audience, target=target, text=text, media=str(media) if media else "",
-                           kinds=kinds, job_name=job_name, requester=requester, group=group, refs=refs,
+                           kinds=kinds, job_name=job_name, requester=requester, refs=refs,
                            status=final or PENDING, clock=now)
     if not final:
         return None
@@ -485,9 +473,7 @@ def _surface(settings: Settings, store: Any, report: FlushReport, clock: float, 
 
 
 def _to_label(rec: dict) -> str:
-    """Who a record was for, in words the owner knows: the group's name, "the family chat", "your chat"."""
-    if rec.get("group_name"):
-        return str(rec["group_name"])
+    """Who a record was for, in words the owner knows: "the owner chat" or "the family chat"."""
     if rec.get("audience") == "owner":
         return "owner chat"
     return "family chat" if rec.get("audience") == "family" else str(rec.get("audience") or "chat")
@@ -497,7 +483,7 @@ def _to_label(rec: dict) -> str:
 def _brief(rec: dict) -> dict:
     text = (rec.get("text") or "").strip()
     return {"id": rec.get("id"), "ts": rec.get("ts"), "audience": rec.get("audience") or "",
-            "group": rec.get("group_name") or "", "target": rec.get("target") or "",
+            "target": rec.get("target") or "",
             "kinds": list(rec.get("kinds") or []), "job": rec.get("job_name") or "",
             "requester": rec.get("requester") or "", "status": rec.get("status") or "",
             "attempts": int(rec.get("attempts") or 0), "last_error": rec.get("last_error") or "",
@@ -524,7 +510,7 @@ def outbox_summary(store: Any, failures: int = SUMMARY_FAILURES) -> dict:
     ``{"counts": {"pending", "sent", "failed", "no_target", "dry_run"}, "undelivered": pending + failed,
     "pending": [oldest pending records], "last_failures": [newest records that failed for good or are pending
     after a failed attempt], "last_sent_ts": epoch seconds or None}``; each record is ``{"id", "ts", "audience",
-    "group", "target", "kinds", "job", "requester", "status", "attempts", "last_error", "last_attempt_ts",
+    "target", "kinds", "job", "requester", "status", "attempts", "last_error", "last_attempt_ts",
     "sent_ts", "text" (first line), "has_photo"}``."""
     try:
         counts = store.outbox_counts()

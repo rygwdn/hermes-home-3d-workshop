@@ -429,12 +429,12 @@ class _Pass:
         started = self.w.get("started_ts")
         if started and self.w.get("started_job") == job and 0 < self.now - float(started) < 7 * 86400:
             ctx["duration_min"] = (self.now - float(started)) / 60.0
-        # who hears about it besides the owner: the group of the chat the request came from (notify.route_for)
+        # who hears about it besides the owner: a household member, decided by who asked (notify.route_for)
         origin = req if (req.get("chat_id") or req.get("sender_id")) else (jobrow or {})
-        route = notify.route_for(self.s, requester=requester, platform=str(origin.get("platform") or ""),
+        route = notify.route_for(self.s, requester=requester,
                                  chat_id=str(origin.get("chat_id") or ""), sender_id=str(origin.get("sender_id") or ""))
         ctx[ROUTE_KEY] = route
-        # "family": a person who asked should hear (announced in their group, or the owner is told nobody was)
+        # "family": a person who asked should hear (announced in their chat, or the owner is told nobody was)
         return ctx, route.announce or route.why == "outsider"
 
     def _note(self, kind: str, job: str, ctx: dict, *, family: bool = False, owner_media: Optional[Path] = None,
@@ -707,16 +707,14 @@ class _Pass:
 
     def _done_part(self, jobrow: Optional[dict], job: str, ctx: dict, left_plate: str,
                    photo: Optional[Path] = None) -> None:
-        """Record a workshop job's finished part in the done box (who it is for, the group told, the photo, how it
+        """Record a workshop job's finished part in the done box (who it is for, the photo, how it
         left the plate). Prints that are not workshop jobs are not recorded. Never raises."""
         if not jobrow or jobrow.get("queue_item_id") is None:
             return
-        route = ctx.get(ROUTE_KEY)
         try:
             self.store.record_done_part(int(jobrow["queue_item_id"]), job_name=pretty_job(job),
                                         title=str(ctx.get("family_job") or pretty_job(job)),
                                         requester=str(jobrow.get("requester") or ""),
-                                        group=route.group if isinstance(route, notify.Route) else "",
                                         photo=str(photo or ""), left_plate=left_plate,
                                         request_id=jobrow.get("request_id"))
         except Exception as exc:
@@ -1140,7 +1138,7 @@ class _Pass:
     # -- delivery --
     def deliver_notes(self) -> list[dict]:
         """Turn this pass's notes into outbox records (``notify.enqueue``): ONE owner message (its texts merged, the
-        first photo) and one message per group chat a requester is told in (that group's language and tone). The
+        first photo) and one family message for eligible requesters. The
         records are sent by ``deliver`` (``notify.flush``); an event counts as told only once its record went out."""
         if not self.notes:
             return []
@@ -1149,16 +1147,15 @@ class _Pass:
         owner_parts: list[str] = []
         owner_events: list[int] = []
         owner_media: Optional[Path] = None
-        buckets: dict[tuple, dict] = {}  # (audience, language, target, group) -> parts, media, events, who
+        family_notice: Optional[dict] = None
         not_told = [str(x) for x in self.w.get("not_told_for") or []]
         for n in self.notes:
             route = n.ctx.get(ROUTE_KEY)
             ctx = {k: v for k, v in n.ctx.items() if k != ROUTE_KEY}
             owner_text = messages.render(n.kind, "owner", lang, **ctx) if n.owner else ""
-            family_text, group = "", ""
+            family_text = ""
             if n.family and isinstance(route, notify.Route) and route.announce:
-                family_text = messages.render(n.kind, route.audience, route.language, **ctx)
-                group = route.group
+                family_text = messages.render(n.kind, "family", lang, **ctx)
             elif n.family and isinstance(route, notify.Route) and route.why == "outsider":
                 key = str(ctx.get("queue_item_id") or n.job)
                 if key not in not_told and messages.render(n.kind, "family", lang, **ctx):
@@ -1167,7 +1164,7 @@ class _Pass:
                     owner_text = "\n".join(x for x in (owner_text, line) if x)
             payload = {k: v for k, v in ctx.items() if v not in (None, "")}
             payload.update(n.payload)
-            payload.update(owner_text=owner_text, family_text=family_text, group=group)
+            payload.update(owner_text=owner_text, family_text=family_text)
             try:
                 event_id = self.store.add_event(n.kind, n.job, _jsonable(payload))
             except Exception as exc:
@@ -1179,16 +1176,17 @@ class _Pass:
                 if event_id is not None:
                     owner_events.append(event_id)
             if family_text:
-                b = buckets.setdefault((route.audience, route.language, route.target, route.group),
-                                       {"parts": [], "media": None, "events": [], "job": n.job,
-                                        "requester": str(ctx.get("requester") or ""), "kinds": []})
+                if family_notice is None:
+                    family_notice = {"parts": [], "media": None, "events": [], "job": n.job,
+                                     "requester": str(ctx.get("requester") or ""), "kinds": []}
+                b = family_notice
                 b["parts"].append(family_text)
                 b["media"] = b["media"] or n.family_media
                 b["kinds"].append(n.kind)
                 if event_id is not None:
                     b["events"].append(event_id)
             results.append({"event_id": event_id, "kind": n.kind, "job": n.job, "owner_text": owner_text,
-                            "family_text": family_text, "group": group, "owner_media": str(n.owner_media or ""),
+                            "family_text": family_text, "owner_media": str(n.owner_media or ""),
                             "family_media": str(n.family_media or "") if family_text else "", "deliveries": []})
         self.w["not_told_for"] = not_told[-NOT_TOLD_KEEP:]
         dry = not self.deliver
@@ -1203,11 +1201,13 @@ class _Pass:
                                    dry_run=dry)
                 self._announced_via_outbox = True
                 records.append((d, "owner"))
-            for (audience, language, target, group), b in buckets.items():
-                d = notify.enqueue(self.s, self.store, audience=audience, target=target, text="\n\n".join(b["parts"]),
+            if family_notice is not None:
+                b = family_notice
+                d = notify.enqueue(self.s, self.store, audience="family", target=self.s.family_target,
+                                   text="\n\n".join(b["parts"]),
                                    media=b["media"], kinds=b["kinds"], job_name=b["job"], requester=b["requester"],
-                                   group=group, event_ids=b["events"], now=self.now, dry_run=dry)
-                records.append((d, audience))
+                                   event_ids=b["events"], now=self.now, dry_run=dry)
+                records.append((d, "family"))
         except Exception as exc:
             _log(f"outbox write failed: {exc}")
         self._pass_deliveries = [d for d, _ in records if d is not None]
@@ -1271,7 +1271,7 @@ class _Pass:
         self.send_outbox(results)
         if self._surfaced:
             results.append({"event_id": None, "kind": notify.FAILURE_KIND, "job": "", "owner_text": self._surfaced,
-                            "family_text": "", "group": "", "owner_media": "", "family_media": "",
+                            "family_text": "", "owner_media": "", "family_media": "",
                             "deliveries": []})
         self.w.update(now=self.now, updated=time.time())
         self.store.kv_set(KV_KEY, _jsonable(self.w))

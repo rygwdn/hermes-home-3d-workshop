@@ -22,7 +22,7 @@ The screen's buttons run ``/home3d`` as the local user, so who may act is decide
 (``hooks.who_may``): the local owner while ``local_is_owner`` is on. ``start_policy: known`` changes nothing here: it
 lets a listed person start their own job from their chat, and the owner's notice about it shows under notices.
 
-People and groups come from the ``groups`` setting and ``notify.route_for``; notices from the store's outbox; the
+Notices come from the store's outbox; the
 done box from ``Store.done_box``; open human-needed moments from ``Store.open_human_needed``; the setup list from
 ``home3d.checks``.
 
@@ -147,44 +147,14 @@ def _settings(rt) -> Any:
     return rt.settings
 
 
-# ---- merged code: groups, outbox, done box, setup checks -----------------------------------------------------------
-def _origin(store: Any, job: Optional[dict]) -> dict:
-    """Where a job's request came from (``platform``, ``chat_id``, ``sender_id``), as the watcher routes it."""
-    req: dict = {}
-    if job and job.get("request_id"):
-        try:
-            req = store.get_request(int(job["request_id"])) or {}
-        except Exception:
-            req = {}
-    return req if (req.get("chat_id") or req.get("sender_id")) else (job or {})
-
-
-def person_group(settings: Any, name: str, origin: Optional[dict] = None) -> str:
-    """The configured group (``groups`` setting) a request belongs to, by ``notify.route_for``: the group whose chat
-    it came from, else the group listing its sender. "" for the owner, a household member outside every group
-    (``family_target``) and anyone not announced."""
-    from . import notify
-
-    o = origin or {}
-    route = notify.route_for(settings, requester=str(name or ""), platform=str(o.get("platform") or ""),
-                             chat_id=str(o.get("chat_id") or ""), sender_id=str(o.get("sender_id") or ""))
-    return route.group if route.announce else ""
-
-
-def groups(settings: Any) -> list[dict]:
-    """The chat groups the workshop serves (``Settings.group_list``): ``[{"name", "tone", "language", "members"}]``
-    with ``members`` a count. No target and no member id: the screen only names them."""
-    return [{"name": g.name, "tone": g.tone, "language": settings.group_language(g), "members": len(g.members or [])}
-            for g in settings.group_list()]
-
-
+# ---- merged code: outbox, done box, setup checks ------------------------------------------------------------------
 NOTICE_STATUSES = ("pending", "sent", "failed", "no_target", "dry_run")
 
 
 def notices(rt, store: Any, *, owner: bool = True) -> dict:
     """Did everyone get told? From the store's outbox (``notify.outbox_summary`` counts and the newest records).
 
-    ``{"pending", "failed", "dry_run", "no_target", "sent", "recent": [{"id", "ts", "to", "group", "audience",
+    ``{"pending", "failed", "dry_run", "no_target", "sent", "recent": [{"id", "ts", "to", "audience",
     "kind", "job", "status", "attempts", "error", "text", "photo"}]}``. ``dry_run`` is a simulated notice (nothing was
     sent on purpose), not a failure. A target is never included; ``text`` and ``error`` only when the viewer is the
     owner (``owner``), otherwise the screen gets counts and who each notice was for."""
@@ -204,7 +174,7 @@ def notices(rt, store: Any, *, owner: bool = True) -> dict:
         if status == "no_target":
             err = err or "no chat to send to: kept in the outbox"
         recent.append({"id": _int(r.get("id")), "ts": float(r.get("ts") or 0), "to": notify._to_label(r),
-                       "group": str(r.get("group_name") or ""), "audience": str(r.get("audience") or ""),
+                       "audience": str(r.get("audience") or ""),
                        "kind": ",".join(r.get("kinds") or []), "job": pretty_name(r.get("job_name")),
                        "status": status, "attempts": int(r.get("attempts") or 0),
                        "error": err if owner else "", "text": text[:160] if owner else "",
@@ -224,7 +194,6 @@ _setup_running: dict = {}  # key -> threading.Event (set when the run ends)
 def _setup_key(settings: Any) -> tuple:
     return (str(data_dir()), settings.backend, settings.bambuddy_url, settings.printer_id,
             settings.autoeject_printer_preset, settings.owner_target, settings.family_target,
-            tuple(sorted(json.dumps(g, sort_keys=True, default=str) for g in settings.groups or [])),
             tuple(settings.owner_ids or []))
 
 
@@ -316,15 +285,10 @@ def _printer(status: Any, err: str) -> dict:
             "awaiting_plate_clear": bool(status.awaiting_plate_clear)}
 
 
-def _who(settings: Any, requester: Any, origin: Optional[dict] = None) -> dict:
-    """``{"name", "group"}``; an empty requester is the owner (the store's convention). ``origin``: where the request
-    came from (``_origin``), so the group is the one the watcher announces the job in."""
+def _who(settings: Any, requester: Any) -> dict:
+    """An empty requester is the owner (the store's convention)."""
     name = str(requester or "").strip() or str(settings.owner_name or "Owner")
-    try:
-        group = person_group(settings, str(requester or "").strip(), origin)
-    except Exception:
-        group = ""
-    return {"name": name, "group": group}
+    return {"name": name}
 
 
 def _slice_meta(store: Any, sliced_file_id: Any) -> dict:
@@ -527,7 +491,7 @@ def _waiting_entry(rt, settings: Any, status: Any, queue: list, trays: list, *, 
     asked_name = who or (job or {}).get("requester") or ""
     return {"id": rid, "key": f"req-{rid}" if rid is not None else f"{action}-{qid}", "action": action,
             "source": source, "queue_item_id": qid, "name": name,
-            "asked_by": _who(settings, asked_name, _origin(store, job) if job else None),
+            "asked_by": _who(settings, asked_name),
             "asked_ts": float(asked_ts or 0), "request_text": str((req or {}).get("text") or ""),
             "facts": facts, "checklist": checklist, "ready": bool(gate is not None and gate.ok),
             "command": command, "alt": alt, "model": _model_for(store, job, meta) if job else None}
@@ -589,7 +553,7 @@ def _queue(rt, settings: Any, queue: Optional[list]) -> list[dict]:
         job = store.get_job(q.id) if ours else None
         meta = _slice_meta(store, (job or {}).get("sliced_file_id"))
         out.append({"id": q.id, "name": pretty_name(q.name),
-                    "for": _who(settings, job.get("requester"), _origin(store, job)) if job else {"name": "", "group": ""},
+                    "for": _who(settings, job.get("requester")) if job else {"name": ""},
                     "status": str(q.status or ""), "position": q.position, "manual_start": bool(q.manual_start),
                     "ours": ours, "print_time_min": round(q.print_time_s / 60) if q.print_time_s else
                     _int(meta.get("print_time_min")),
@@ -612,7 +576,7 @@ def _now(rt, settings: Any, status: Any, queue: Optional[list]) -> Optional[dict
         job = store.job_by_name(status.job_name)
     qid = _int((job or {}).get("queue_item_id")) if job else (printing.id if printing is not None else None)
     return {"queue_item_id": qid, "name": pretty_name(status.job_name),
-            "for": _who(settings, job.get("requester"), _origin(store, job)) if job else None,
+            "for": _who(settings, job.get("requester")) if job else None,
             "ours": job is not None, "eject_planned": bool(job.get("eject_planned")) if job else None,
             "started_ts": _num((job or {}).get("started_ts"), 0),
             "model": _model_for(store, job) if job else None}
@@ -715,8 +679,7 @@ def _done_box(rt, settings: Any) -> list[dict]:
         requester = str(r.get("requester") or "").strip()
         part_id = _int(r.get("id"))
         out.append({"id": part_id, "job_id": qid, "name": name,
-                    "for": {"name": requester or str(settings.owner_name or "Owner"),
-                            "group": str(r.get("group_name") or "")},
+                    "for": {"name": requester or str(settings.owner_name or "Owner")},
                     "finished_ts": _num(r.get("ts"), 0), "outcome": kind, "detail": detail, "photo": photo,
                     "collected": bool(r.get("collected")), "collected_by": str(r.get("collected_by") or ""),
                     "collected_ts": _num(r.get("collected_ts"), 0), "command": f"home3d collected {part_id}"})
@@ -867,7 +830,6 @@ def build_overview(rt) -> dict:
         "setup": section("setup", lambda: setup_checks(rt, settings), {"checks": [], "checked_ts": None,
                                                                          "pending": False}),
         "watcher": watcher,
-        "groups": section("groups", lambda: groups(settings), []),
         "viewer": viewer,
     }
     if not viewer["is_owner"]:  # setup details name chat targets and URLs: only the owner reads them
@@ -935,4 +897,4 @@ def dumps(overview: dict) -> str:
 
 
 __all__ = ["SCHEMA_VERSION", "FileRefError", "build_overview", "health", "resolve_file", "file_payload", "file_ref",
-           "pretty_name", "groups", "person_group", "notices", "setup_checks", "dumps"]
+           "pretty_name", "notices", "setup_checks", "dumps"]
